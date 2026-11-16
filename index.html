@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xbox Stick Calibrator</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#5b6470; --line:#dde1e6; --accent:#107c10; --warn:#b35c00; --bad:#c62828; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.35rem; margin:4px 0 2px; }
+  .sub { color:var(--muted); margin:0 0 14px; font-size:.92rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
+  ol { margin:6px 0 0; padding-left:20px; } li { margin:3px 0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button, select { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:#fff; color:var(--ink); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.danger { background:#fff4e5; border-color:#f0c48a; }
+  button:disabled { opacity:.45; }
+  #big { font-size:1.1rem; font-weight:650; margin:4px 0; min-height:1.5em; }
+  #big.bad { color:var(--bad); } #big.ok { color:var(--accent); }
+  #progress { color:var(--muted); min-height:1.3em; font-size:.93rem; }
+  #info { color:var(--muted); font-size:.9rem; margin-top:8px; word-break:break-word; }
+  .sticks { display:flex; justify-content:center; gap:18px; margin-top:8px; }
+  .sticks figure { margin:0; text-align:center; font-size:.9rem; color:var(--muted); }
+  canvas { width:130px; height:130px; }
+  table { width:100%; border-collapse:collapse; font-size:.82rem; }
+  th, td { text-align:left; border-bottom:1px solid var(--line); padding:5px 4px; vertical-align:top; }
+  .scroll { overflow-x:auto; }
+  .note { font-size:.85rem; color:var(--muted); }
+  .warnbox { background:#fff4e5; border:1px solid #f0c48a; border-radius:8px; padding:10px; font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Xbox Stick Calibrator</h1>
+  <p class="sub">Permanent thumbstick calibration for Xbox Series X|S controllers, from Chrome on Android. Free. Same commands as the Xbox Accessories app.</p>
+
+  <div class="card" id="unsupported" hidden>
+    <b>This browser can't talk to USB devices.</b> Use Chrome on Android (or Chrome/Edge on a computer).
+  </div>
+
+  <div class="card">
+    <b>Before you start</b>
+    <ol>
+      <li>Controller firmware 5.19.3221.0 or later (update it in the Xbox Accessories app or on the console).</li>
+      <li>Plug the controller into the phone with a USB-C cable (or OTG adapter).</li>
+      <li>Tap <b>Connect</b>, pick the controller, then <b>Check</b> (read-only) before <b>Calibrate</b>.</li>
+    </ol>
+    <p class="warnbox">Calibrating <b>erases</b> each stick's stored calibration as soon as it starts. Finish every step. If you stop part-way, the controller uses its defaults until you calibrate it again.</p>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect" class="primary">Connect controller</button>
+      <button id="check" disabled>Check (read-only)</button>
+      <select id="which" aria-label="Which sticks">
+        <option value="both">Both sticks</option><option value="left">Left only</option><option value="right">Right only</option>
+      </select>
+      <button id="calibrate" class="danger" disabled>Calibrate</button>
+    </div>
+    <div id="info">Not connected.</div>
+    <div id="big" role="status" aria-live="polite"></div>
+    <div id="progress"></div>
+    <div class="sticks">
+      <figure><canvas id="cl" width="260" height="260"></canvas><figcaption id="tl">Left</figcaption></figure>
+      <figure><canvas id="cr" width="260" height="260"></canvas><figcaption id="tr">Right</figcaption></figure>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>Log (this phone)</b>
+      <span class="row"><button id="copy">Copy CSV</button><button id="dl">Download CSV</button><button id="clear">Clear</button></span>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Time</th><th>Controller</th><th>FW</th><th>Stick</th><th>Before</th><th>After</th><th>Rest off-centre</th></tr></thead><tbody id="log"></tbody></table></div>
+    <p class="note" id="copied"></p>
+  </div>
+
+  <p class="note">Protocol from the open-source xboxctl project (0BSD): github.com/bb441db/xboxctl. Not affiliated with Microsoft. A stick that is still well off centre after calibrating is worn and needs replacing.</p>
+</main>
+
+<script id="core">
+// ---------- GIP packet format (pure functions; checked by selftest) ----------
+const CMD_ACK = 0x01, CMD_HELLO = 0x02, CMD_CAL = 0x1e, CMD_INPUT = 0x20;
+const FLAG_ACME = 0x10, FLAG_SYSTEM = 0x20, FLAG_FRAGMENT = 0x80;
+const SUB_READ = 0x0f, SUB_START = 0x10, STATUS_SAVING = 0x10;
+const STICKS = { left: 1, right: 2 };
+const MIN_FW = [5, 19, 3221, 0];
+
+function packet(cmd, flags, seq, payload) { return Uint8Array.from([cmd, flags, seq, payload.length, ...payload]); }
+
+function readVarint(b, pos) {
+  let v = 0;
+  for (const shift of [0, 7, 14, 21]) {
+    if (pos >= b.length) return [null, pos];
+    const byte = b[pos++];
+    v |= (byte & 0x7f) << shift;
+    if (!(byte & 0x80)) return [v, pos];
+  }
+  return [null, pos];
+}
+
+function parse(b) {
+  if (b.length < 4) return null;
+  let [len, pos] = readVarint(b, 3);
+  if (len === null) return null;
+  if (b[1] & FLAG_FRAGMENT) [, pos] = readVarint(b, pos);
+  const payload = b.slice(pos, pos + len);
+  return payload.length === len ? { cmd: b[0], flags: b[1], seq: b[2], payload } : null;
+}
+
+const wantsAck = p => !!(p.flags & FLAG_ACME) && p.cmd !== CMD_ACK;
+
+function ackFor(p) {
+  const body = new Uint8Array(9);
+  body[1] = p.cmd; body[2] = FLAG_SYSTEM | (p.flags & 0x0f);
+  body[3] = p.payload.length & 0xff; body[4] = p.payload.length >> 8;
+  return packet(CMD_ACK, FLAG_SYSTEM, p.seq, [...body]);
+}
+
+const u16 = (b, i) => b[i] | (b[i + 1] << 8);
+const i16 = (b, i) => { const v = u16(b, i); return v >= 0x8000 ? v - 0x10000 : v; };
+
+function parseHello(p) {
+  if (p.cmd !== CMD_HELLO || p.payload.length < 28) return null;
+  const pl = p.payload;
+  return { id: [...pl.slice(0, 8)].map(x => x.toString(16).padStart(2, "0")).join(""),
+           fw: [0, 1, 2, 3].map(i => u16(pl, 12 + i * 2)) };
+}
+
+function parseCal(p) {
+  if (p.cmd !== CMD_CAL || !p.payload.length) return null;
+  const pl = p.payload;
+  if (pl.length === 2 && (pl[0] === SUB_READ || pl[0] === SUB_START) && pl[1] !== 0) return { kind: "rejected" };
+  if (pl[0] === SUB_READ && pl.length >= 3) {
+    const sticks = {}; let i = 3;
+    while (i < pl.length) {
+      const mask = pl[i];
+      const size = (mask === 1 || mask === 2) ? 8 : (mask === 4 || mask === 8) ? 5 : null;
+      if (size === null) break;
+      if (i + 1 + size > pl.length) return null; // truncated block
+      if (size === 8) sticks[mask] = [0, 1, 2, 3].map(k => u16(pl, i + 1 + k * 2));
+      i += 1 + size;
+    }
+    return { kind: "read", status: pl[2], sticks };
+  }
+  if (pl[0] === SUB_START && pl.length >= 3) return { kind: "start", status: pl[1], mask: pl[2] };
+  return null;
+}
+
+function parseAxes(p) {
+  if (p.cmd !== CMD_INPUT || p.payload.length < 14) return null;
+  return [6, 8, 10, 12].map(i => i16(p.payload, i));
+}
+
+const hasCal = l => !!l && (l[1] !== 0 || l[3] !== 0);
+const fmt = l => hasCal(l) ? `H ${l[0]}-${l[1]}, V ${l[2]}-${l[3]}` : "none stored (defaults)";
+const fwOlder = (a, b) => { for (let i = 0; i < 4; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
+
+function selftest() {
+  const eq = (a, b) => JSON.stringify([...a]) === JSON.stringify([...b]);
+  const ok = [];
+  ok.push(eq(packet(CMD_CAL, FLAG_ACME, 3, [SUB_READ, 3]), [0x1e, 0x10, 3, 2, 0x0f, 3]));
+  ok.push(eq(packet(CMD_CAL, FLAG_ACME, 4, [SUB_START, 1]), [0x1e, 0x10, 4, 2, 0x10, 1]));
+  const read = [0x0f,0,0,1,0xa6,3,0x80,0x0c,0xba,3,0x57,0x0c,2,0xa1,3,0x90,0x0c,0x94,3,0x9c,0x0c];
+  const r = parseCal(parse(packet(CMD_CAL, FLAG_ACME, 7, read)));
+  ok.push(r.kind === "read" && r.status === 0 && eq(r.sticks[1], [0x3a6, 0xc80, 0x3ba, 0xc57]) && eq(r.sticks[2], [0x3a1, 0xc90, 0x394, 0xc9c]));
+  ok.push(parseCal(parse(packet(CMD_CAL, FLAG_ACME, 7, read.slice(0, 16)))) === null);
+  ok.push(parseCal(parse(packet(CMD_CAL, FLAG_ACME, 7, [0x10, 0, 3]))).kind === "start");
+  ok.push(parseCal(parse(packet(CMD_CAL, FLAG_ACME, 7, [0x0f, 1]))).kind === "rejected");
+  const hello = Uint8Array.from([0x02,0x20,0xe4,0x1c,0x7e,0xed,0x8d,0xa3,0x8d,0xaa,0,0,0x5e,4,0x12,0x0b,5,0,0x17,0,6,0,0,0,8,4,1,0,1,0,1,0]);
+  ok.push(eq(parseHello(parse(hello)).fw, [5, 23, 6, 0]));
+  const a = ackFor({ cmd: 4, flags: 0x30, seq: 3, payload: new Uint8Array(0x3a) });
+  ok.push(eq(a.slice(0, 4), [1, 0x20, 3, 9]) && a[5] === 4 && a[7] === 0x3a && a[8] === 0);
+  const axes = [0,0,0,0,0,0, ...[-300, 25, 32767, -32768].flatMap(v => [v & 0xff, (v >> 8) & 0xff])];
+  ok.push(eq(parseAxes(parse(packet(CMD_INPUT, 0, 9, axes))), [-300, 25, 32767, -32768]));
+  ok.push(!fwOlder([5, 23, 6, 0], MIN_FW) && fwOlder([5, 13, 3146, 0], MIN_FW));
+  return ok.every(Boolean);
+}
+</script>
+
+<script>
+// ---------- USB link ----------
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let dev = null, seq = 1, axes = null, waiters = [], writeChain = Promise.resolve(), busy = false;
+
+function nextSeq() { const s = seq; seq = s % 255 + 1; return s; }
+function send(bytes) { // keep writes in order
+  writeChain = writeChain.then(() => dev.transferOut(2, bytes)).catch(() => {});
+  return writeChain;
+}
+function waitFor(match, ms) {
+  return new Promise(resolve => {
+    const w = { match, resolve };
+    waiters.push(w);
+    setTimeout(() => { const i = waiters.indexOf(w); if (i >= 0) { waiters.splice(i, 1); resolve(null); } }, ms);
+  });
+}
+async function readLoop(d) {
+  while (dev === d) {
+    let r;
+    try { r = await d.transferIn(2, 64); }
+    catch (e) { if (dev === d) disconnected(e.message); return; }
+    if (r.status === "stall") { try { await d.clearHalt("in", 2); } catch {} continue; }
+    if (!r.data || !r.data.byteLength) continue;
+    const p = parse(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength));
+    if (!p) continue;
+    if (wantsAck(p)) send(ackFor(p));
+    const ax = parseAxes(p); if (ax) axes = ax;
+    for (const w of waiters.slice()) if (w.match(p)) { waiters.splice(waiters.indexOf(w), 1); w.resolve(p); }
+  }
+}
+
+async function startDevice() {
+  const hello = waitFor(p => !!parseHello(p), 1500);
+  await send(Uint8Array.from([0x05, 0x20, 0x01, 0x01, 0x00])); // Set Device State: Start
+  const p = await hello;
+  return p ? parseHello(p) : null;
+}
+
+async function exchange(sub, mask, want) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const reply = waitFor(p => { const r = parseCal(p); return !!r && (r.kind === "rejected" || r.kind === want); }, 2000);
+    await send(packet(CMD_CAL, FLAG_ACME, nextSeq(), [sub, mask]));
+    const p = await reply;
+    if (p) {
+      const r = parseCal(p);
+      if (r.kind === "rejected") throw new Error("The controller refused the calibration request, so it doesn't support it.");
+      return r;
+    }
+  }
+  throw new Error("No reply to the calibration request. Firmware probably too old: update it, then try again.");
+}
+const readCal = mask => exchange(SUB_READ, mask, "read");
+
+// ---------- UI ----------
+function say(text, cls = "") { $("big").textContent = text; $("big").className = cls; }
+function progress(text) { $("progress").textContent = text; }
+function setButtons() {
+  $("connect").disabled = busy;
+  $("check").disabled = busy || !dev;
+  $("calibrate").disabled = busy || !dev;
+  $("which").disabled = busy;
+}
+function disconnected(why) {
+  dev = null; axes = null; waiters = [];
+  $("info").textContent = "Not connected." + (why ? ` (${why})` : "");
+  setButtons();
+}
+
+let current = null; // {id, fw}
+async function connect() {
+  try {
+    const d = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x045e }, { vendorId: 0x2e95 }] });
+    await d.open();
+    if (d.configuration === null) await d.selectConfiguration(1);
+    await d.claimInterface(0);
+    dev = d; seq = 1; waiters = [];
+    readLoop(d);
+    const hello = await startDevice();
+    current = hello || { id: "unknown", fw: null };
+    const fwText = current.fw ? current.fw.join(".") : "unknown";
+    $("info").textContent = `Connected: ${d.productName || "controller"} · ID ${current.id} · firmware ${fwText}`;
+    if (current.fw && fwOlder(current.fw, MIN_FW)) say("Firmware is older than 5.19.3221.0: update it first or calibration won't work.", "bad");
+    else say("Connected. Tap Check (read-only) first.");
+  } catch (e) {
+    if (e.name === "NotFoundError") return; // user closed the picker
+    say(`Couldn't open the controller: ${e.message}`, "bad");
+    progress("If another app is using it, close it and replug. On Windows this needs the WinUSB driver.");
+    disconnected();
+  }
+  setButtons();
+}
+
+async function check() {
+  busy = true; setButtons();
+  try {
+    const r = await readCal(3);
+    say("Checked. Nothing changed.", "ok");
+    progress(`Stored now: left ${fmt(r.sticks[1])} · right ${fmt(r.sticks[2])}` + (r.status ? " · an earlier calibration is still pending" : ""));
+  } catch (e) { say(e.message, "bad"); }
+  busy = false; setButtons();
+}
+
+async function calibrateStick(name) {
+  const mask = STICKS[name];
+  await exchange(SUB_START, mask, "start");
+  say(`${name.toUpperCase()} stick: push it to the edge and turn slowly in full circles. About 6 clockwise, then about 6 anticlockwise, until it says Done.`);
+  const t0 = Date.now(); let seenActive = false;
+  while (true) {
+    const { status } = await readCal(mask);
+    seenActive ||= status !== 0;
+    if (seenActive && status === 0) break;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (!seenActive && secs > 5) throw new Error("the controller did not start the calibration");
+    if (secs > 240) throw new Error("timed out after 4 minutes");
+    progress(status === STATUS_SAVING ? "Saving..." : `Keep turning... ${secs} s`);
+    await sleep(300);
+  }
+  const r = await readCal(mask);
+  if (!hasCal(r.sticks[mask])) throw new Error("the controller finished without storing a calibration");
+  return r.sticks[mask];
+}
+
+async function calibrate() {
+  if (!confirm("Calibrating ERASES each stick's stored calibration as soon as it starts.\n\nFinish every step. Continue?")) return;
+  busy = true; setButtons();
+  const which = $("which").value, sticks = which === "both" ? ["left", "right"] : [which];
+  const after = {};
+  let before = {};
+  try {
+    const r = await readCal(3);
+    before = r.sticks;
+    if (r.status !== 0) throw new Error("An earlier calibration is still pending. Unplug, plug back in, reconnect and try again.");
+    for (const name of sticks) {
+      try { after[name] = await calibrateStick(name); progress(`${name} stick done: ${fmt(after[name])}`); }
+      catch (e) { say(`${name} stick FAILED: ${e.message}. It now uses defaults. Unplug, replug and calibrate again.`, "bad"); break; }
+    }
+    let rest = null;
+    if (Object.keys(after).length === sticks.length) {
+      say("Done. Let go of both sticks now: reading the rest position...");
+      await sleep(3000); // reports only come on change, so the last one after letting go is the rest position
+      if (axes) { const n = axes.map(v => v / 32767); rest = [Math.hypot(n[0], n[1]), Math.hypot(n[2], n[3])]; }
+      const worn = rest ? ["left", "right"].filter((s, i) => rest[i] > 0.10) : [];
+      say("Calibrated and saved to the controller." + (worn.length ? ` ${worn.join(" and ")} still over 10% off centre: likely worn.` : "") + " Unplug it and connect the next one.", worn.length ? "bad" : "ok");
+    }
+    const time = new Date().toISOString().slice(0, 19).replace("T", " ");
+    for (const name of sticks) addLog({ time, controller: current.id, fw: current.fw ? current.fw.join(".") : "unknown", stick: name,
+      before: fmt(before[STICKS[name]]), after: name in after ? fmt(after[name]) : "FAILED / not done",
+      rest: rest ? (rest[name === "left" ? 0 : 1] * 100).toFixed(1) + "%" : "" });
+  } catch (e) { say(e.message, "bad"); }
+  busy = false; setButtons();
+}
+
+// ---------- stick drawing ----------
+function drawStick(canvas, label, x, y) {
+  const c = canvas.getContext("2d"), s = canvas.width, m = s / 2, R = s / 2 - 12;
+  c.clearRect(0, 0, s, s);
+  c.strokeStyle = "#c5cbd3"; c.lineWidth = 2;
+  c.beginPath(); c.arc(m, m, R, 0, 7); c.stroke();
+  c.beginPath(); c.moveTo(m - R, m); c.lineTo(m + R, m); c.moveTo(m, m - R); c.lineTo(m, m + R); c.stroke();
+  if (x === null) { label.textContent = label.dataset.name + " (no data)"; return; }
+  c.fillStyle = "#107c10"; c.beginPath(); c.arc(m + x * R, m - y * R, 12, 0, 7); c.fill();
+  label.textContent = `${label.dataset.name} ${(Math.hypot(x, y) * 100).toFixed(1)}%`;
+}
+$("tl").dataset.name = "Left"; $("tr").dataset.name = "Right";
+(function frame() {
+  const n = axes ? axes.map(v => v / 32767) : [null, null, null, null];
+  drawStick($("cl"), $("tl"), n[0], n[1]);
+  drawStick($("cr"), $("tr"), n[2], n[3]);
+  requestAnimationFrame(frame);
+})();
+
+// ---------- log (kept in this browser) ----------
+const COLS = ["time", "controller", "fw", "stick", "before", "after", "rest"];
+function loadLog() { try { return JSON.parse(localStorage.getItem("xboxCalLog") || "[]"); } catch { return []; } }
+function saveLog(rows) { try { localStorage.setItem("xboxCalLog", JSON.stringify(rows)); } catch {} }
+function renderLog() {
+  $("log").innerHTML = "";
+  for (const row of loadLog().slice().reverse()) {
+    const tr = document.createElement("tr");
+    for (const k of COLS) { const td = document.createElement("td"); td.textContent = row[k]; tr.appendChild(td); }
+    $("log").appendChild(tr);
+  }
+}
+function addLog(row) { const rows = loadLog(); rows.push(row); saveLog(rows); renderLog(); }
+function csv() {
+  const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  return [COLS.join(","), ...loadLog().map(r => COLS.map(k => esc(r[k])).join(","))].join("\n");
+}
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(csv()); $("copied").textContent = "Copied. Paste into Excel."; }
+  catch { $("copied").textContent = "Copy was blocked. Use Download instead."; }
+};
+$("dl").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv()], { type: "text/csv" }));
+  a.download = "calibration_log.csv"; a.click();
+};
+$("clear").onclick = () => { if (confirm("Clear the log on this phone?")) { saveLog([]); renderLog(); } };
+
+// ---------- start ----------
+if (!selftest()) say("Internal self-test failed: don't use this page. Tell whoever gave it to you.", "bad");
+if (!("usb" in navigator)) { $("unsupported").hidden = false; $("connect").disabled = true; }
+else {
+  navigator.usb.addEventListener("disconnect", e => { if (e.device === dev) disconnected("unplugged"); });
+  $("connect").onclick = connect; $("check").onclick = check; $("calibrate").onclick = calibrate;
+}
+renderLog();
+</script>
+</body>
+</html>
